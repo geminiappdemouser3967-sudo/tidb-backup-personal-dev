@@ -17,6 +17,7 @@ package copr
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/metapb"
@@ -446,6 +447,93 @@ func TestLocateBucketNilFallback(t *testing.T) {
 	require.Equal(t, lkr, result[0], "Expected original LocationKeyRanges to be returned")
 
 	t.Log("StartKey outside location fallback working correctly - returned unsplit ranges instead of panicking")
+}
+
+// TestBucketFallbackWithoutSplitPreservesRegion checks that a range mismatch
+// does not evict unchanged metadata or probe PD on every repeated fallback.
+func TestBucketFallbackWithoutSplitPreservesRegion(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, mockClient.Close())
+	}()
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"), []byte("z"))
+	const bucketVersion uint64 = 7
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, bucketVersion)
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	ctx := context.Background()
+	bo := backoff.NewBackofferWithVars(ctx, 3000, nil)
+
+	_, err = cache.SplitKeyRangesByLocations(bo, buildCopRanges("a", "z"), UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	cachedLoc := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, cachedLoc)
+	require.Equal(t, bucketVersion, cachedLoc.GetBucketVersion())
+	cachedRegion := cache.GetCachedRegionWithRLock(cachedLoc.Region)
+	require.NotNil(t, cachedRegion)
+
+	// Use the same mismatch as the split regression, but leave PD unchanged.
+	ranges := NewKeyRanges([]kv.KeyRange{
+		{StartKey: []byte("a"), EndKey: []byte("z")},
+		{StartKey: []byte("b"), EndKey: []byte("p")},
+	})
+	locs, err := cache.SplitKeyRangesByLocations(bo, ranges, UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	require.Len(t, locs, 2)
+	_, fallback := locs[1].splitKeyRangesByBuckets(ctx)
+	require.NotNil(t, fallback)
+	require.Equal(t, "range_start_outside_location", fallback.reason)
+	require.Equal(t, bucketVersion, fallback.bucketVersion)
+
+	// Count entries into the direct PD probe path, not just returned epochs:
+	// eviction followed by reloading unchanged metadata would keep the epoch.
+	probes := 0
+	const probeFailpoint = "github.com/pingcap/tidb/pkg/store/copr/beforeBucketFallbackPDProbe"
+	require.NoError(t, failpoint.EnableCall(probeFailpoint, func() { probes++ }))
+	defer func() {
+		require.NoError(t, failpoint.Disable(probeFailpoint))
+	}()
+	result, err := cache.SplitKeyRangesByBuckets(bo, ranges)
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+	require.Equal(t, 1, probes, "the first fallback should check PD")
+	require.Same(t, cachedRegion, cache.GetCachedRegionWithRLock(cachedLoc.Region),
+		"unchanged metadata must not be invalidated and reloaded")
+
+	// Hold the reservation in the future so this assertion is independent of
+	// test-machine speed. No sleeps or production clock changes are required.
+	cache.bucketFallbackMu.Lock()
+	cache.bucketFallbackNextProbe[cachedLoc.Region] = time.Now().Add(time.Hour)
+	cache.bucketFallbackMu.Unlock()
+	for range 3 {
+		result, err = cache.SplitKeyRangesByBuckets(bo, ranges)
+		require.NoError(t, err)
+		require.NotEmpty(t, result)
+		require.Equal(t, 1, probes, "repeated fallback must not probe PD again during the cooldown")
+		require.Same(t, cachedRegion, cache.GetCachedRegionWithRLock(cachedLoc.Region))
+		current := cache.TryLocateKey([]byte("m"))
+		require.NotNil(t, current)
+		require.Equal(t, cachedLoc.Region, current.Region)
+		require.Equal(t, []byte("z"), current.EndKey)
+	}
+
+	// A negative check must not suppress recovery forever. After a real split,
+	// expire the reservation deterministically and verify invalidation resumes.
+	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(regionIDs[1], newRegionID, []byte("t"), []uint64{newPeerID}, newPeerID)
+	cache.bucketFallbackMu.Lock()
+	cache.bucketFallbackNextProbe[cachedLoc.Region] = time.Time{}
+	cache.bucketFallbackMu.Unlock()
+	_, err = cache.SplitKeyRangesByBuckets(bo, ranges)
+	require.NoError(t, err)
+	require.Equal(t, 2, probes)
+	require.Nil(t, cache.GetCachedRegionWithRLock(cachedLoc.Region))
+	right := cache.TryLocateKey([]byte("t"))
+	require.NotNil(t, right)
+	require.Equal(t, newRegionID, right.Region.GetID())
 }
 
 // TestStaleBucketFallbackInvalidatesRegion checks that fallback evicts the

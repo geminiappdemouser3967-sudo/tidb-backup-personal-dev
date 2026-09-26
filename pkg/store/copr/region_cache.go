@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -497,11 +499,47 @@ func validateLocationCoverage(ctx context.Context, kvRanges []tikv.KeyRange, loc
 // RegionCache wraps tikv.RegionCache.
 type RegionCache struct {
 	*tikv.RegionCache
+
+	// Bound fallback probes independently of request rate, including when PD
+	// reports unchanged metadata or fails. Reserve before the RPC so concurrent
+	// sub-requests for the same epoch do not each probe PD.
+	bucketFallbackMu        sync.Mutex
+	bucketFallbackNextProbe map[tikv.RegionVerID]time.Time
 }
 
 // NewRegionCache returns a new RegionCache.
 func NewRegionCache(rc *tikv.RegionCache) *RegionCache {
-	return &RegionCache{rc}
+	return &RegionCache{RegionCache: rc}
+}
+
+const (
+	bucketFallbackProbeInterval = time.Second
+	maxBucketFallbackProbes     = 128
+)
+
+// allowBucketFallbackProbe limits fallback diagnostics and refresh checks.
+// A negative result is temporary: a later split of the same cached epoch must
+// still be discoverable. Saturation defers probes rather than evicting live
+// reservations, which would let alternating regions defeat the limit.
+func (c *RegionCache) allowBucketFallbackProbe(region tikv.RegionVerID, now time.Time) bool {
+	c.bucketFallbackMu.Lock()
+	defer c.bucketFallbackMu.Unlock()
+	for id, nextProbe := range c.bucketFallbackNextProbe {
+		if !now.Before(nextProbe) {
+			delete(c.bucketFallbackNextProbe, id)
+		}
+	}
+	if _, reserved := c.bucketFallbackNextProbe[region]; reserved {
+		return false
+	}
+	if len(c.bucketFallbackNextProbe) >= maxBucketFallbackProbes {
+		return false
+	}
+	if c.bucketFallbackNextProbe == nil {
+		c.bucketFallbackNextProbe = make(map[tikv.RegionVerID]time.Time)
+	}
+	c.bucketFallbackNextProbe[region] = now.Add(bucketFallbackProbeInterval)
+	return true
 }
 
 // SplitRegionRanges gets the split ranges from pd region.
@@ -939,28 +977,40 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 				)
 			}
 		}
-		// Best-effort: query PD directly for region boundary comparison.
-		pdLoc, pdErr := c.RegionCache.LocateRegionByIDFromPD(bo.TiKVBackoffer(), cachedLoc.Region.GetID())
-		if pdErr != nil {
-			fields = append(fields, zap.Error(pdErr))
-		} else {
-			fields = append(fields,
-				zap.Uint64("pdRegionVer", pdLoc.Region.GetVer()),
-				zap.Uint64("pdRegionConfVer", pdLoc.Region.GetConfVer()),
-				keyField("pdRegionStartKey", pdLoc.StartKey),
-				keyField("pdRegionEndKey", pdLoc.EndKey),
-				zap.Bool("pdEpochChanged", pdLoc.Region.GetVer() != cachedLoc.Region.GetVer() || pdLoc.Region.GetConfVer() != cachedLoc.Region.GetConfVer()),
-				zap.Bool("pdBoundaryChanged", !bytes.Equal(pdLoc.StartKey, cachedLoc.StartKey) || !bytes.Equal(pdLoc.EndKey, cachedLoc.EndKey)),
-			)
-			if pdLoc.Buckets != nil {
-				fields = append(fields,
-					zap.Uint64("pdBucketsVer", pdLoc.GetBucketVersion()),
-					zap.Int("pdBucketKeyCount", len(pdLoc.Buckets.Keys)),
-				)
+		// Reuse the bounded diagnostic probe to confirm a key-range change.
+		// Repeated fallback with unchanged metadata must not churn the cache.
+		regionChanged := false
+		probePD := fallback.bucketVersion != 0 &&
+			c.allowBucketFallbackProbe(cachedLoc.Region, time.Now())
+		fields = append(fields, zap.Bool("fallbackPDProbe", probePD))
+		if probePD {
+			failpoint.InjectCall("beforeBucketFallbackPDProbe")
+			pdLoc, pdErr := c.RegionCache.LocateRegionByIDFromPD(bo.TiKVBackoffer(), cachedLoc.Region.GetID())
+			if pdErr != nil {
+				fields = append(fields, zap.Error(pdErr))
 			} else {
-				fields = append(fields, zap.Bool("pdBucketsNil", true))
+				// Bucket inconsistency alone is not evidence of a region split.
+				regionChanged = pdLoc.Region.GetVer() > cachedLoc.Region.GetVer() &&
+					(!bytes.Equal(pdLoc.StartKey, cachedLoc.StartKey) || !bytes.Equal(pdLoc.EndKey, cachedLoc.EndKey))
+				fields = append(fields,
+					zap.Uint64("pdRegionVer", pdLoc.Region.GetVer()),
+					zap.Uint64("pdRegionConfVer", pdLoc.Region.GetConfVer()),
+					keyField("pdRegionStartKey", pdLoc.StartKey),
+					keyField("pdRegionEndKey", pdLoc.EndKey),
+					zap.Bool("pdEpochChanged", pdLoc.Region.GetVer() != cachedLoc.Region.GetVer() || pdLoc.Region.GetConfVer() != cachedLoc.Region.GetConfVer()),
+					zap.Bool("pdBoundaryChanged", !bytes.Equal(pdLoc.StartKey, cachedLoc.StartKey) || !bytes.Equal(pdLoc.EndKey, cachedLoc.EndKey)),
+				)
+				if pdLoc.Buckets != nil {
+					fields = append(fields,
+						zap.Uint64("pdBucketsVer", pdLoc.GetBucketVersion()),
+						zap.Int("pdBucketKeyCount", len(pdLoc.Buckets.Keys)),
+					)
+				} else {
+					fields = append(fields, zap.Bool("pdBucketsNil", true))
+				}
 			}
 		}
+
 		if fallback.bucketStart != nil || fallback.bucketEnd != nil {
 			fields = append(fields,
 				keyField("fallbackBucketStartKey", fallback.bucketStart),
@@ -974,12 +1024,12 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 		)
 		logutil.Logger(ctx).Warn("SplitKeyRangesByBuckets fell back to region-only splitting", fields...)
 
-		// Invalidate the suspect bucket generation before rebuilding without buckets.
+		// Invalidate only after PD confirms a newer region with changed boundaries.
 		// Use the location start: fallback.startKey can be outside this region.
 		// Preserve an entry that has already advanced to a different epoch or bucket
 		// version. This check is best-effort: client-go cannot atomically compare the
 		// bucket version and invalidate, so a racing refresh may cause an extra reload.
-		if fallback.bucketVersion != 0 {
+		if regionChanged {
 			currentLoc := c.RegionCache.TryLocateKey(cachedLoc.StartKey)
 			if currentLoc != nil && currentLoc.Region == cachedLoc.Region &&
 				currentLoc.GetBucketVersion() == fallback.bucketVersion {
