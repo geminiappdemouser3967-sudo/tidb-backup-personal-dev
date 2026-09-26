@@ -536,6 +536,138 @@ func TestBucketFallbackWithoutSplitPreservesRegion(t *testing.T) {
 	require.Equal(t, newRegionID, right.Region.GetID())
 }
 
+// TestLateBucketFallbackPreservesRefreshedRegions fixes the interleaving where
+// one request holds pre-split locations while another refreshes both children.
+func TestLateBucketFallbackPreservesRefreshedRegions(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, mockClient.Close())
+	}()
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"), []byte("z"))
+	const bucketVersion uint64 = 7
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, bucketVersion)
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	warmBO := backoff.NewBackofferWithVars(ctx, 3000, nil)
+	_, err = cache.SplitKeyRangesByLocations(warmBO, buildCopRanges("a", "z"), UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	staleLoc := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, staleLoc)
+	require.Equal(t, bucketVersion, staleLoc.GetBucketVersion())
+	require.Equal(t, []byte("z"), staleLoc.EndKey)
+
+	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(regionIDs[1], newRegionID, []byte("t"), []uint64{newPeerID}, newPeerID)
+
+	// Request A has already detected fallback and captured its old location
+	// when it reaches this barrier. Request B will refresh while A is paused.
+	entered := make(chan struct{}, 1)
+	resume := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(resume)
+			released = true
+		}
+	}
+	const probeFailpoint = "github.com/pingcap/tidb/pkg/store/copr/beforeBucketFallbackPDProbe"
+	require.NoError(t, failpoint.EnableCall(probeFailpoint, func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-resume:
+		case <-ctx.Done():
+		}
+	}))
+	defer func() {
+		require.NoError(t, failpoint.Disable(probeFailpoint))
+	}()
+
+	type fallbackResult struct {
+		locs []*LocationKeyRanges
+		err  error
+	}
+	results := make(chan fallbackResult, 1)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		lateBO := backoff.NewBackofferWithVars(ctx, 3000, nil)
+		ranges := NewKeyRanges([]kv.KeyRange{
+			{StartKey: []byte("a"), EndKey: []byte("z")},
+			{StartKey: []byte("b"), EndKey: []byte("p")},
+		})
+		locs, err := cache.SplitKeyRangesByBuckets(lateBO, ranges)
+		results <- fallbackResult{locs: locs, err: err}
+	}()
+	// Release and join A before disabling the hook or closing the cache,
+	// including when a main-goroutine assertion fails.
+	defer func() {
+		cancel()
+		release()
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Error("late fallback did not stop after cancellation")
+		}
+	}()
+	select {
+	case <-entered:
+	case result := <-results:
+		t.Fatalf("fallback did not reach the barrier (enable failpoints): %v", result.err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the late fallback barrier")
+	}
+	require.NotNil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
+
+	// Request B performs the ordinary error-driven invalidate-and-reload path.
+	// Its backoffer is separate from A's; the test does not share mutable request
+	// state between goroutines.
+	refreshBO := backoff.NewBackofferWithVars(ctx, 3000, nil)
+	cache.InvalidateCachedRegion(staleLoc.Region)
+	refreshed, err := cache.SplitKeyRangesByLocations(refreshBO, buildCopRanges("m", "z"), UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	require.Len(t, refreshed, 2)
+	leftLoc, rightLoc := refreshed[0].Location, refreshed[1].Location
+	require.Equal(t, regionIDs[1], leftLoc.Region.GetID())
+	require.Greater(t, leftLoc.Region.GetVer(), staleLoc.Region.GetVer())
+	require.Equal(t, []byte("t"), leftLoc.EndKey)
+	require.Equal(t, newRegionID, rightLoc.Region.GetID())
+	require.Equal(t, []byte("t"), rightLoc.StartKey)
+	require.Equal(t, []byte("z"), rightLoc.EndKey)
+	leftRegion := cache.GetCachedRegionWithRLock(leftLoc.Region)
+	rightRegion := cache.GetCachedRegionWithRLock(rightLoc.Region)
+	require.NotNil(t, leftRegion)
+	require.NotNil(t, rightRegion)
+	require.Nil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
+
+	// A now sees PD's newer boundaries but must not invalidate B's entries.
+	release()
+	var result fallbackResult
+	select {
+	case result = <-results:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the late fallback to finish")
+	}
+	require.NoError(t, result.err)
+	require.NotEmpty(t, result.locs)
+	for _, loc := range result.locs {
+		require.NotEqual(t, staleLoc.Region, loc.Location.Region,
+			"the late request must rebuild with current region epochs")
+	}
+	require.Same(t, leftRegion, cache.GetCachedRegionWithRLock(leftLoc.Region),
+		"late fallback must not evict and reload the refreshed left child")
+	require.Same(t, rightRegion, cache.GetCachedRegionWithRLock(rightLoc.Region),
+		"late fallback must preserve the refreshed right child")
+	require.Nil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
+}
+
 // TestStaleBucketFallbackInvalidatesRegion checks that fallback evicts the
 // cached pre-split epoch before rebuilding tasks without buckets.
 func TestStaleBucketFallbackInvalidatesRegion(t *testing.T) {
