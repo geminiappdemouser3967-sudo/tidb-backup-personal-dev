@@ -448,6 +448,82 @@ func TestLocateBucketNilFallback(t *testing.T) {
 	t.Log("StartKey outside location fallback working correctly - returned unsplit ranges instead of panicking")
 }
 
+// TestStaleBucketFallbackInvalidatesRegion checks that fallback evicts the
+// cached pre-split epoch before rebuilding tasks without buckets.
+func TestStaleBucketFallbackInvalidatesRegion(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, mockClient.Close())
+	}()
+
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"), []byte("z"))
+	const bucketVersion uint64 = 7
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, bucketVersion)
+
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	ctx := context.Background()
+	bo := backoff.NewBackofferWithVars(ctx, 3000, nil)
+
+	// Warm both regions, including buckets, before PD learns about the split.
+	_, err = cache.SplitKeyRangesByLocations(bo, buildCopRanges("a", "z"), UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	staleLoc := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, staleLoc)
+	require.Equal(t, regionIDs[1], staleLoc.Region.GetID())
+	require.Equal(t, bucketVersion, staleLoc.GetBucketVersion())
+	require.Equal(t, []byte("z"), staleLoc.EndKey)
+	require.NotNil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
+
+	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(regionIDs[1], newRegionID, []byte("t"), []uint64{newPeerID}, newPeerID)
+	stillCached := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, stillCached)
+	require.Equal(t, staleLoc.Region, stillCached.Region)
+	require.Equal(t, []byte("z"), stillCached.EndKey)
+
+	// The contained range becomes out of order after the region/bucket splits:
+	// [a,z), [b,p) -> [m,z), [b,p) -> [t,z), [b,p).
+	// This deterministically reaches the outside-location fallback with the
+	// nonzero bucket version from the still-cached pre-split descriptor.
+	ranges := NewKeyRanges([]kv.KeyRange{
+		{StartKey: []byte("a"), EndKey: []byte("z")},
+		{StartKey: []byte("b"), EndKey: []byte("p")},
+	})
+	locs, err := cache.SplitKeyRangesByLocations(bo, ranges, UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	require.Len(t, locs, 2)
+	require.Equal(t, staleLoc.Region, locs[1].Location.Region)
+	_, fallback := locs[1].splitKeyRangesByBuckets(ctx)
+	require.NotNil(t, fallback)
+	require.Equal(t, "range_start_outside_location", fallback.reason)
+	require.Equal(t, bucketVersion, fallback.bucketVersion)
+	require.NotNil(t, cache.GetCachedRegionWithRLock(staleLoc.Region),
+		"detecting fallback alone must not invalidate the shared cache")
+
+	// Exercise the outer fallback handler; do not invalidate the cache in the
+	// test. Without the fix, the bucket-less rebuild reuses the old epoch.
+	result, err := cache.SplitKeyRangesByBuckets(bo, ranges)
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+	require.Nil(t, cache.GetCachedRegionWithRLock(staleLoc.Region),
+		"fallback must evict the pre-split region epoch")
+
+	left := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, left)
+	require.Equal(t, regionIDs[1], left.Region.GetID())
+	require.Greater(t, left.Region.GetVer(), staleLoc.Region.GetVer())
+	require.Equal(t, []byte("t"), left.EndKey)
+	right := cache.TryLocateKey([]byte("t"))
+	require.NotNil(t, right)
+	require.Equal(t, newRegionID, right.Region.GetID())
+	require.Equal(t, []byte("t"), right.StartKey)
+	require.Equal(t, []byte("z"), right.EndKey)
+}
+
 // TestLocateBucketOutsideRegionNonNilFallback tests a subtle stale-bucket case:
 // LocateBucket can return a non-nil bucket even when key is outside the region boundaries.
 // Our bucket splitting must not livelock and should fall back safely.
