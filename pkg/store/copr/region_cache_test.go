@@ -468,19 +468,22 @@ func TestLocateBucketNilFallback(t *testing.T) {
 // does not evict unchanged metadata or probe PD on every repeated fallback.
 func TestBucketFallbackWithoutSplitPreservesRegion(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		version uint64
+		name          string
+		version       uint64
+		changeConfVer bool
 	}{
 		{name: "zero", version: 0},
 		{name: "nonzero", version: 7},
+		{name: "zero_conf_ver_changed", version: 0, changeConfVer: true},
+		{name: "nonzero_conf_ver_changed", version: 7, changeConfVer: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testBucketFallbackWithoutSplitPreservesRegion(t, tc.version)
+			testBucketFallbackWithoutSplitPreservesRegion(t, tc.version, tc.changeConfVer)
 		})
 	}
 }
 
-func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion uint64) {
+func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion uint64, changeConfVer bool) {
 	t.Helper()
 	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
 	require.NoError(t, err)
@@ -504,7 +507,20 @@ func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion u
 	cachedRegion := cache.GetCachedRegionWithRLock(cachedLoc.Region)
 	require.NotNil(t, cachedRegion)
 
-	// Use the same mismatch as the split regression, but leave PD unchanged.
+	if changeConfVer {
+		// Adding a peer changes only the configuration epoch in PD.
+		before, _ := cluster.GetRegion(regionIDs[1])
+		storeID := cluster.AllocID()
+		cluster.AddStore(storeID, "conf-ver-store")
+		cluster.AddPeer(regionIDs[1], storeID, cluster.AllocID())
+		after, _ := cluster.GetRegion(regionIDs[1])
+		require.Greater(t, after.GetRegionEpoch().GetConfVer(), cachedLoc.Region.GetConfVer())
+		require.Equal(t, cachedLoc.Region.GetVer(), after.GetRegionEpoch().GetVersion())
+		require.Equal(t, before.GetStartKey(), after.GetStartKey())
+		require.Equal(t, before.GetEndKey(), after.GetEndKey())
+	}
+
+	// Use the same mismatch as the split regression without changing PD's range.
 	ranges := NewKeyRanges([]kv.KeyRange{
 		{StartKey: []byte("a"), EndKey: []byte("z")},
 		{StartKey: []byte("b"), EndKey: []byte("p")},
@@ -552,7 +568,11 @@ func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion u
 	// A negative check must not suppress recovery forever. After a real split,
 	// expire the reservation deterministically and verify invalidation resumes.
 	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
-	cluster.Split(regionIDs[1], newRegionID, []byte("t"), []uint64{newPeerID}, newPeerID)
+	newPeerIDs := []uint64{newPeerID}
+	if changeConfVer {
+		newPeerIDs = append(newPeerIDs, cluster.AllocID())
+	}
+	cluster.Split(regionIDs[1], newRegionID, []byte("t"), newPeerIDs, newPeerID)
 	cache.bucketFallbackMu.Lock()
 	cache.bucketFallbackNextProbe[cachedLoc.Region] = time.Time{}
 	cache.bucketFallbackMu.Unlock()
@@ -827,19 +847,22 @@ func TestLateZeroVersionBucketFallbackPreservesRefreshedBuckets(t *testing.T) {
 // cached pre-split epoch before rebuilding tasks without buckets.
 func TestStaleBucketFallbackInvalidatesRegion(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		version uint64
+		name          string
+		version       uint64
+		changeConfVer bool
 	}{
 		{name: "zero", version: 0},
 		{name: "nonzero", version: 7},
+		{name: "zero_conf_ver_changed", version: 0, changeConfVer: true},
+		{name: "nonzero_conf_ver_changed", version: 7, changeConfVer: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testStaleBucketFallbackInvalidatesRegion(t, tc.version)
+			testStaleBucketFallbackInvalidatesRegion(t, tc.version, tc.changeConfVer)
 		})
 	}
 }
 
-func testStaleBucketFallbackInvalidatesRegion(t *testing.T, bucketVersion uint64) {
+func testStaleBucketFallbackInvalidatesRegion(t *testing.T, bucketVersion uint64, changeConfVer bool) {
 	t.Helper()
 	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
 	require.NoError(t, err)
@@ -869,6 +892,17 @@ func testStaleBucketFallbackInvalidatesRegion(t *testing.T, bucketVersion uint64
 
 	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
 	cluster.Split(regionIDs[1], newRegionID, []byte("t"), []uint64{newPeerID}, newPeerID)
+	if changeConfVer {
+		// The retained left region has both a new range and configuration epoch.
+		storeID := cluster.AllocID()
+		cluster.AddStore(storeID, "conf-ver-store")
+		cluster.AddPeer(regionIDs[1], storeID, cluster.AllocID())
+	}
+	pdRegion, _ := cluster.GetRegion(regionIDs[1])
+	require.Greater(t, pdRegion.GetRegionEpoch().GetVersion(), staleLoc.Region.GetVer())
+	if changeConfVer {
+		require.Greater(t, pdRegion.GetRegionEpoch().GetConfVer(), staleLoc.Region.GetConfVer())
+	}
 	stillCached := cache.TryLocateKey([]byte("m"))
 	require.NotNil(t, stillCached)
 	require.Equal(t, staleLoc.Region, stillCached.Region)
@@ -905,6 +939,7 @@ func testStaleBucketFallbackInvalidatesRegion(t *testing.T, bucketVersion uint64
 	require.NotNil(t, left)
 	require.Equal(t, regionIDs[1], left.Region.GetID())
 	require.Greater(t, left.Region.GetVer(), staleLoc.Region.GetVer())
+	require.Equal(t, pdRegion.GetRegionEpoch().GetConfVer(), left.Region.GetConfVer())
 	require.Equal(t, []byte("t"), left.EndKey)
 	right := cache.TryLocateKey([]byte("t"))
 	require.NotNil(t, right)
