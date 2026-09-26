@@ -518,23 +518,64 @@ func TestBucketFallbackWithoutSplitPreservesRegion(t *testing.T) {
 		require.True(t, cache.allowBucketFallbackProbe(region, finished.Add(bucketFallbackProbeInterval)))
 	})
 
+	t.Run("capacity_and_expiry", func(t *testing.T) {
+		cache := &RegionCache{}
+		now := time.Now()
+		regions := make([]tikv.RegionVerID, maxBucketFallbackProbes)
+		for i := range regions {
+			regions[i] = tikv.NewRegionVerID(uint64(i+1), 1, 1)
+			require.True(t, cache.allowBucketFallbackProbe(regions[i], now))
+		}
+		require.Len(t, cache.bucketFallbackNextProbe, 128)
+		extra := tikv.NewRegionVerID(129, 1, 1)
+		require.False(t, cache.allowBucketFallbackProbe(extra, now))
+		later := now.Add(10 * bucketFallbackProbeInterval)
+		require.False(t, cache.allowBucketFallbackProbe(extra, later),
+			"capacity must not be freed by expiring active probes")
+		for _, region := range regions {
+			deadline, exists := cache.bucketFallbackNextProbe[region]
+			require.True(t, exists, "saturation must preserve existing reservations")
+			require.True(t, deadline.IsZero())
+		}
+
+		// Completing one probe keeps its slot occupied until cooldown expires.
+		cache.finishBucketFallbackProbe(regions[0], later)
+		require.False(t, cache.allowBucketFallbackProbe(extra, later.Add(bucketFallbackProbeInterval-time.Nanosecond)))
+		expires := later.Add(bucketFallbackProbeInterval)
+		require.True(t, cache.allowBucketFallbackProbe(extra, expires))
+		require.NotContains(t, cache.bucketFallbackNextProbe, regions[0])
+		require.Len(t, cache.bucketFallbackNextProbe, 128)
+		for _, region := range regions[1:] {
+			require.Contains(t, cache.bucketFallbackNextProbe, region)
+			require.True(t, cache.bucketFallbackNextProbe[region].IsZero())
+		}
+		require.False(t, cache.allowBucketFallbackProbe(regions[0], expires),
+			"the newly admitted region must occupy the reclaimed slot")
+		cache.finishBucketFallbackProbe(extra, expires)
+		require.True(t, cache.allowBucketFallbackProbe(regions[0], expires.Add(bucketFallbackProbeInterval)),
+			"the original region can be admitted again once capacity is available")
+	})
+
 	for _, tc := range []struct {
 		name          string
 		version       uint64
 		changeConfVer bool
+		probeError    bool
 	}{
 		{name: "zero", version: 0},
 		{name: "nonzero", version: 7},
+		{name: "zero_pd_error", version: 0, probeError: true},
+		{name: "nonzero_pd_error", version: 7, probeError: true},
 		{name: "zero_conf_ver_changed", version: 0, changeConfVer: true},
 		{name: "nonzero_conf_ver_changed", version: 7, changeConfVer: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testBucketFallbackWithoutSplitPreservesRegion(t, tc.version, tc.changeConfVer)
+			testBucketFallbackWithoutSplitPreservesRegion(t, tc.version, tc.changeConfVer, tc.probeError)
 		})
 	}
 }
 
-func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion uint64, changeConfVer bool) {
+func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion uint64, changeConfVer, probeError bool) {
 	t.Helper()
 	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
 	require.NoError(t, err)
@@ -592,10 +633,29 @@ func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion u
 	defer func() {
 		require.NoError(t, failpoint.Disable(probeFailpoint))
 	}()
+	injectedErrors := 0
+	const errorFailpoint = "github.com/pingcap/tidb/pkg/store/copr/bucketFallbackPDProbeError"
+	if probeError {
+		require.NoError(t, failpoint.EnableCall(errorFailpoint, func(err *error) {
+			injectedErrors++
+			if injectedErrors == 1 {
+				*err = context.DeadlineExceeded
+			}
+		}))
+		defer func() { require.NoError(t, failpoint.Disable(errorFailpoint)) }()
+	}
 	result, err := cache.SplitKeyRangesByBuckets(bo, ranges)
 	require.NoError(t, err)
 	require.NotEmpty(t, result)
 	require.Equal(t, 1, probes, "the first fallback should check PD")
+	if probeError {
+		require.Equal(t, 1, injectedErrors)
+	}
+	cache.bucketFallbackMu.Lock()
+	deadline, reserved := cache.bucketFallbackNextProbe[cachedLoc.Region]
+	cache.bucketFallbackMu.Unlock()
+	require.True(t, reserved)
+	require.False(t, deadline.IsZero(), "even a failed probe must leave active state and enter cooldown")
 	require.Same(t, cachedRegion, cache.GetCachedRegionWithRLock(cachedLoc.Region),
 		"unchanged metadata must not be invalidated and reloaded")
 
@@ -630,6 +690,9 @@ func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion u
 	_, err = cache.SplitKeyRangesByBuckets(bo, ranges)
 	require.NoError(t, err)
 	require.Equal(t, 2, probes)
+	if probeError {
+		require.Equal(t, 2, injectedErrors, "the probe must run again after the failed probe cooldown expires")
+	}
 	require.Nil(t, cache.GetCachedRegionWithRLock(cachedLoc.Region))
 	right := cache.TryLocateKey([]byte("t"))
 	require.NotNil(t, right)

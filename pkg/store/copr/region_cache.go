@@ -1009,6 +1009,11 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 					c.finishBucketFallbackProbe(cachedLoc.Region, time.Now())
 				}()
 				failpoint.InjectCall("beforeBucketFallbackPDProbe")
+				var probeErr error
+				failpoint.InjectCall("bucketFallbackPDProbeError", &probeErr)
+				if probeErr != nil {
+					return nil, probeErr
+				}
 				return c.RegionCache.LocateRegionByIDFromPD(bo.TiKVBackoffer(), cachedLoc.Region.GetID())
 			}()
 			if pdErr != nil {
