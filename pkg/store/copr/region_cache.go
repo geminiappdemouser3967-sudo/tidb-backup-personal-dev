@@ -566,6 +566,7 @@ func (l *LocationKeyRanges) splitKeyRangesByBuckets(ctx context.Context) ([]*Loc
 			r := ranges.At(0)
 			return []*LocationKeyRanges{l}, &bucketSplitFallbackInfo{
 				reason:              "locate_bucket_nil",
+				bucketVersion:       l.getBucketVersion(),
 				startKey:            startKey,
 				endKey:              r.EndKey,
 				remainingRangeCount: ranges.Len(),
@@ -897,6 +898,7 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 		locationRangeIssues := rangeIssuesForKeyRanges(cachedLocRanges)
 		fields := []zap.Field{
 			zap.String("reason", fallback.reason),
+			zap.Uint64("fallbackBucketsVer", fallback.bucketVersion),
 			zap.Int("locationIndex", locIdx),
 			zap.Int("locationCount", len(locs)),
 			zap.Int("rangeCount", len(kvRanges)),
@@ -971,6 +973,19 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 			zap.Stack("stack"),
 		)
 		logutil.Logger(ctx).Warn("SplitKeyRangesByBuckets fell back to region-only splitting", fields...)
+
+		// Invalidate the suspect bucket generation before rebuilding without buckets.
+		// Use the location start: fallback.startKey can be outside this region.
+		// Preserve an entry that has already advanced to a different epoch or bucket
+		// version. This check is best-effort: client-go cannot atomically compare the
+		// bucket version and invalidate, so a racing refresh may cause an extra reload.
+		if fallback.bucketVersion != 0 {
+			currentLoc := c.RegionCache.TryLocateKey(cachedLoc.StartKey)
+			if currentLoc != nil && currentLoc.Region == cachedLoc.Region &&
+				currentLoc.GetBucketVersion() == fallback.bucketVersion {
+				c.RegionCache.InvalidateCachedRegion(cachedLoc.Region)
+			}
+		}
 
 		locs, err := c.SplitKeyRangesByLocations(bo, ranges, UnspecifiedLimit, false, false)
 		if err != nil {
