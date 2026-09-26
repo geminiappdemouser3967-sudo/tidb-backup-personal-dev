@@ -446,19 +446,48 @@ func TestLocateBucketNilFallback(t *testing.T) {
 	require.Len(t, result, 1, "Expected 1 unsplit LocationKeyRanges")
 	require.Equal(t, lkr, result[0], "Expected original LocationKeyRanges to be returned")
 
+	// Absent/empty buckets return region-only ranges even when the input starts
+	// outside the location. They must not manufacture a version-zero fallback.
+	for _, buckets := range []*metapb.Buckets{nil, {}, {Version: 7}} {
+		withoutKeys := &LocationKeyRanges{
+			Location: &tikv.KeyLocation{
+				Region: loc.Region, StartKey: loc.StartKey, EndKey: loc.EndKey, Buckets: buckets,
+			},
+			Ranges: outsideRanges,
+		}
+		result, fallback := withoutKeys.splitKeyRangesByBuckets(ctx)
+		require.Nil(t, fallback)
+		require.Len(t, result, 1)
+		require.Same(t, withoutKeys, result[0])
+	}
+
 	t.Log("StartKey outside location fallback working correctly - returned unsplit ranges instead of panicking")
 }
 
 // TestBucketFallbackWithoutSplitPreservesRegion checks that a range mismatch
 // does not evict unchanged metadata or probe PD on every repeated fallback.
 func TestBucketFallbackWithoutSplitPreservesRegion(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version uint64
+	}{
+		{name: "zero", version: 0},
+		{name: "nonzero", version: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testBucketFallbackWithoutSplitPreservesRegion(t, tc.version)
+		})
+	}
+}
+
+func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion uint64) {
+	t.Helper()
 	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, mockClient.Close())
 	}()
 	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"), []byte("z"))
-	const bucketVersion uint64 = 7
 	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, bucketVersion)
 	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
 	defer pdCli.Close()
@@ -668,9 +697,150 @@ func TestLateBucketFallbackPreservesRefreshedRegions(t *testing.T) {
 	require.Nil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
 }
 
+// TestLateZeroVersionBucketFallbackPreservesRefreshedBuckets verifies that
+// zero is an unknown bucket version, not a wildcard matching a later generation.
+func TestLateZeroVersionBucketFallbackPreservesRefreshedBuckets(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, mockClient.Close())
+	}()
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"), []byte("z"))
+	const bucketVersion uint64 = 0
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, bucketVersion)
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	warmBO := backoff.NewBackofferWithVars(ctx, 3000, nil)
+	_, err = cache.SplitKeyRangesByLocations(warmBO, buildCopRanges("a", "z"), UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	staleLoc := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, staleLoc)
+	require.Equal(t, bucketVersion, staleLoc.GetBucketVersion())
+	require.Equal(t, []byte("z"), staleLoc.EndKey)
+
+	// Request A captures version-zero buckets before this barrier. Request B
+	// will replace them without changing the region epoch while A is paused.
+	entered := make(chan struct{}, 1)
+	resume := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(resume)
+			released = true
+		}
+	}
+	const probeFailpoint = "github.com/pingcap/tidb/pkg/store/copr/beforeBucketFallbackPDProbe"
+	require.NoError(t, failpoint.EnableCall(probeFailpoint, func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-resume:
+		case <-ctx.Done():
+		}
+	}))
+	defer func() {
+		require.NoError(t, failpoint.Disable(probeFailpoint))
+	}()
+
+	type fallbackResult struct {
+		locs []*LocationKeyRanges
+		err  error
+	}
+	results := make(chan fallbackResult, 1)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		lateBO := backoff.NewBackofferWithVars(ctx, 3000, nil)
+		ranges := NewKeyRanges([]kv.KeyRange{
+			{StartKey: []byte("a"), EndKey: []byte("z")},
+			{StartKey: []byte("b"), EndKey: []byte("p")},
+		})
+		locs, err := cache.SplitKeyRangesByBuckets(lateBO, ranges)
+		results <- fallbackResult{locs: locs, err: err}
+	}()
+	// Release and join A before disabling the hook or closing the cache,
+	// including when a main-goroutine assertion fails.
+	defer func() {
+		cancel()
+		release()
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Error("late fallback did not stop after cancellation")
+		}
+	}()
+	select {
+	case <-entered:
+	case result := <-results:
+		t.Fatalf("fallback did not reach the barrier (enable failpoints): %v", result.err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the late fallback barrier")
+	}
+	require.NotNil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
+
+	// Request B refreshes only the buckets; the region epoch stays the same.
+	const refreshedBucketVersion uint64 = 8
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, refreshedBucketVersion)
+	refreshBO := backoff.NewBackofferWithVars(ctx, 3000, nil)
+	cache.InvalidateCachedRegion(staleLoc.Region)
+	refreshed, err := cache.SplitKeyRangesByLocations(refreshBO, buildCopRanges("m", "z"), UnspecifiedLimit, false, true)
+	require.NoError(t, err)
+	require.Len(t, refreshed, 1)
+	refreshedLoc := refreshed[0].Location
+	require.Equal(t, staleLoc.Region, refreshedLoc.Region)
+	require.Equal(t, refreshedBucketVersion, refreshedLoc.GetBucketVersion())
+	refreshedRegion := cache.GetCachedRegionWithRLock(refreshedLoc.Region)
+	require.NotNil(t, refreshedRegion)
+
+	// Now split in PD without refreshing this cache again. A's probe will see a
+	// real range change, so only the bucket-version guard can prevent A from
+	// evicting B's replacement under the same RegionVerID. A later request using
+	// version 8 can perform its own recovery after the probe cooldown.
+	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(regionIDs[1], newRegionID, []byte("t"), []uint64{newPeerID}, newPeerID)
+
+	// A sees PD's newer boundaries but must preserve B's bucket generation.
+	release()
+	var result fallbackResult
+	select {
+	case result = <-results:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the late fallback to finish")
+	}
+	require.NoError(t, result.err)
+	require.NotEmpty(t, result.locs)
+	require.Same(t, refreshedRegion, cache.GetCachedRegionWithRLock(refreshedLoc.Region),
+		"late version-zero fallback must not evict the nonzero bucket generation")
+	current := cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, current)
+	require.Equal(t, refreshedLoc.Region, current.Region)
+	require.Equal(t, refreshedBucketVersion, current.GetBucketVersion())
+}
+
 // TestStaleBucketFallbackInvalidatesRegion checks that fallback evicts the
 // cached pre-split epoch before rebuilding tasks without buckets.
 func TestStaleBucketFallbackInvalidatesRegion(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version uint64
+	}{
+		{name: "zero", version: 0},
+		{name: "nonzero", version: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testStaleBucketFallbackInvalidatesRegion(t, tc.version)
+		})
+	}
+}
+
+func testStaleBucketFallbackInvalidatesRegion(t *testing.T, bucketVersion uint64) {
+	t.Helper()
 	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
 	require.NoError(t, err)
 	defer func() {
@@ -678,7 +848,6 @@ func TestStaleBucketFallbackInvalidatesRegion(t *testing.T) {
 	}()
 
 	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"), []byte("z"))
-	const bucketVersion uint64 = 7
 	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{[]byte("m"), []byte("t"), []byte("z")}, bucketVersion)
 
 	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
@@ -708,7 +877,7 @@ func TestStaleBucketFallbackInvalidatesRegion(t *testing.T) {
 	// The contained range becomes out of order after the region/bucket splits:
 	// [a,z), [b,p) -> [m,z), [b,p) -> [t,z), [b,p).
 	// This deterministically reaches the outside-location fallback with the
-	// nonzero bucket version from the still-cached pre-split descriptor.
+	// bucket version from the still-cached pre-split descriptor.
 	ranges := NewKeyRanges([]kv.KeyRange{
 		{StartKey: []byte("a"), EndKey: []byte("z")},
 		{StartKey: []byte("b"), EndKey: []byte("p")},

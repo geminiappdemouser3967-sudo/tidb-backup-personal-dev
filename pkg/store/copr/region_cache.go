@@ -980,8 +980,9 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 		// Reuse the bounded diagnostic probe to confirm a key-range change.
 		// Repeated fallback with unchanged metadata must not churn the cache.
 		regionChanged := false
-		probePD := fallback.bucketVersion != 0 &&
-			c.allowBucketFallbackProbe(cachedLoc.Region, time.Now())
+		// Nonempty bucket metadata may have an unknown (zero) version.
+		// PD-confirmed range changes, not bucket version presence, authorize eviction.
+		probePD := c.allowBucketFallbackProbe(cachedLoc.Region, time.Now())
 		fields = append(fields, zap.Bool("fallbackPDProbe", probePD))
 		if probePD {
 			failpoint.InjectCall("beforeBucketFallbackPDProbe")
