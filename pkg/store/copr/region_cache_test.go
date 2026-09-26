@@ -409,9 +409,8 @@ func TestPanicInSplitKeyRangesByBuckets(t *testing.T) {
 	t.Logf("Test completed successfully - panic was caught, diagnostics logged, and re-panicked as expected")
 }
 
-// TestLocateBucketNilFallback tests that when the first range starts outside the
-// location boundaries, splitKeyRangesByBuckets returns unsplit ranges instead of
-// panicking.
+// TestLocateBucketNilFallback checks unsplit fallback for out-of-region input
+// and injected defensive bucket failures, including their bucket versions.
 func TestLocateBucketNilFallback(t *testing.T) {
 	ctx := context.Background()
 
@@ -461,12 +460,64 @@ func TestLocateBucketNilFallback(t *testing.T) {
 		require.Same(t, withoutKeys, result[0])
 	}
 
+	for _, version := range []uint64{0, 7} {
+		versionName := "nonzero"
+		if version == 0 {
+			versionName = "zero"
+		}
+		for _, tc := range []struct {
+			name   string
+			reason string
+		}{
+			{name: "nil", reason: "locate_bucket_nil"},
+			{name: "no_progress", reason: "bucket_not_contain_start_no_progress"},
+		} {
+			t.Run(tc.reason+"/"+versionName, func(t *testing.T) {
+				inside := &LocationKeyRanges{
+					Location: &tikv.KeyLocation{
+						Region: loc.Region, StartKey: loc.StartKey, EndKey: loc.EndKey,
+						Buckets: &metapb.Buckets{
+							Keys: [][]byte{[]byte("a"), []byte("f"), []byte("m")}, Version: version,
+						},
+					},
+					Ranges: buildCopRanges("b", "h"),
+				}
+				const hook = "github.com/pingcap/tidb/pkg/store/copr/bucketSplitFallbackForTest"
+				require.NoError(t, failpoint.Enable(hook, "return(\""+tc.name+"\")"))
+				defer func() { require.NoError(t, failpoint.Disable(hook)) }()
+				result, fallback := inside.splitKeyRangesByBuckets(ctx)
+				require.NotNil(t, fallback)
+				require.Equal(t, tc.reason, fallback.reason)
+				require.Equal(t, version, fallback.bucketVersion)
+				require.Equal(t, []byte("b"), fallback.startKey)
+				require.Equal(t, []byte("h"), fallback.endKey)
+				require.Equal(t, 1, fallback.remainingRangeCount)
+				require.Len(t, result, 1)
+				require.Same(t, inside, result[0])
+			})
+		}
+	}
+
 	t.Log("StartKey outside location fallback working correctly - returned unsplit ranges instead of panicking")
 }
 
 // TestBucketFallbackWithoutSplitPreservesRegion checks that a range mismatch
 // does not evict unchanged metadata or probe PD on every repeated fallback.
 func TestBucketFallbackWithoutSplitPreservesRegion(t *testing.T) {
+	t.Run("active_probe_and_completion_cooldown", func(t *testing.T) {
+		cache := &RegionCache{}
+		region := tikv.NewRegionVerID(1, 1, 1)
+		started := time.Now()
+		require.True(t, cache.allowBucketFallbackProbe(region, started))
+		finished := started.Add(10 * bucketFallbackProbeInterval)
+		require.False(t, cache.allowBucketFallbackProbe(region, finished),
+			"an active probe must remain reserved beyond the cooldown interval")
+		cache.finishBucketFallbackProbe(region, finished)
+		require.False(t, cache.allowBucketFallbackProbe(region, finished))
+		require.False(t, cache.allowBucketFallbackProbe(region, finished.Add(bucketFallbackProbeInterval-time.Nanosecond)))
+		require.True(t, cache.allowBucketFallbackProbe(region, finished.Add(bucketFallbackProbeInterval)))
+	})
+
 	for _, tc := range []struct {
 		name          string
 		version       uint64
@@ -574,7 +625,7 @@ func testBucketFallbackWithoutSplitPreservesRegion(t *testing.T, bucketVersion u
 	}
 	cluster.Split(regionIDs[1], newRegionID, []byte("t"), newPeerIDs, newPeerID)
 	cache.bucketFallbackMu.Lock()
-	cache.bucketFallbackNextProbe[cachedLoc.Region] = time.Time{}
+	cache.bucketFallbackNextProbe[cachedLoc.Region] = time.Now().Add(-bucketFallbackProbeInterval)
 	cache.bucketFallbackMu.Unlock()
 	_, err = cache.SplitKeyRangesByBuckets(bo, ranges)
 	require.NoError(t, err)
@@ -673,6 +724,9 @@ func TestLateBucketFallbackPreservesRefreshedRegions(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for the late fallback barrier")
 	}
+	// A is paused inside its probe. Advancing the admission clock must not
+	// admit another probe for this epoch, even after the old cooldown elapsed.
+	require.False(t, cache.allowBucketFallbackProbe(staleLoc.Region, time.Now().Add(10*bucketFallbackProbeInterval)))
 	require.NotNil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
 
 	// Request B performs the ordinary error-driven invalidate-and-reload path.
@@ -802,6 +856,9 @@ func TestLateZeroVersionBucketFallbackPreservesRefreshedBuckets(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for the late fallback barrier")
 	}
+	// A is paused inside its probe. Advancing the admission clock must not
+	// admit another probe for this epoch, even after the old cooldown elapsed.
+	require.False(t, cache.allowBucketFallbackProbe(staleLoc.Region, time.Now().Add(10*bucketFallbackProbeInterval)))
 	require.NotNil(t, cache.GetCachedRegionWithRLock(staleLoc.Region))
 
 	// Request B refreshes only the buckets; the region epoch stays the same.

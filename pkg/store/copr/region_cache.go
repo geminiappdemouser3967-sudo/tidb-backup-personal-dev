@@ -502,7 +502,8 @@ type RegionCache struct {
 
 	// Bound fallback probes independently of request rate, including when PD
 	// reports unchanged metadata or fails. Reserve before the RPC so concurrent
-	// sub-requests for the same epoch do not each probe PD.
+	// sub-requests for the same epoch do not each probe PD. A zero deadline
+	// denotes an active probe; its cooldown begins when the probe finishes.
 	bucketFallbackMu        sync.Mutex
 	bucketFallbackNextProbe map[tikv.RegionVerID]time.Time
 }
@@ -525,7 +526,7 @@ func (c *RegionCache) allowBucketFallbackProbe(region tikv.RegionVerID, now time
 	c.bucketFallbackMu.Lock()
 	defer c.bucketFallbackMu.Unlock()
 	for id, nextProbe := range c.bucketFallbackNextProbe {
-		if !now.Before(nextProbe) {
+		if !nextProbe.IsZero() && !now.Before(nextProbe) {
 			delete(c.bucketFallbackNextProbe, id)
 		}
 	}
@@ -538,8 +539,16 @@ func (c *RegionCache) allowBucketFallbackProbe(region tikv.RegionVerID, now time
 	if c.bucketFallbackNextProbe == nil {
 		c.bucketFallbackNextProbe = make(map[tikv.RegionVerID]time.Time)
 	}
-	c.bucketFallbackNextProbe[region] = now.Add(bucketFallbackProbeInterval)
+	c.bucketFallbackNextProbe[region] = time.Time{}
 	return true
+}
+
+// finishBucketFallbackProbe releases an active probe into cooldown, including
+// failed probes. Active reservations must not expire while PD is still running.
+func (c *RegionCache) finishBucketFallbackProbe(region tikv.RegionVerID, now time.Time) {
+	c.bucketFallbackMu.Lock()
+	defer c.bucketFallbackMu.Unlock()
+	c.bucketFallbackNextProbe[region] = now.Add(bucketFallbackProbeInterval)
 }
 
 // SplitRegionRanges gets the split ranges from pd region.
@@ -598,6 +607,16 @@ func (l *LocationKeyRanges) splitKeyRangesByBuckets(ctx context.Context) ([]*Loc
 		}
 
 		bucket := loc.LocateBucket(startKey)
+		// Exercise defensive branches that current client-go normally prevents.
+		failpoint.Inject("bucketSplitFallbackForTest", func(val failpoint.Value) {
+			switch val.(string) {
+			case "nil":
+				bucket = nil
+			case "no_progress":
+				bucket.StartKey = loc.EndKey
+				bucket.EndKey = loc.EndKey
+			}
+		})
 		// Defensive: LocateBucket should never return nil because startKey is inside location.
 		// If it does, fall back to region-only splitting.
 		if bucket == nil {
@@ -985,8 +1004,13 @@ func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) 
 		probePD := c.allowBucketFallbackProbe(cachedLoc.Region, time.Now())
 		fields = append(fields, zap.Bool("fallbackPDProbe", probePD))
 		if probePD {
-			failpoint.InjectCall("beforeBucketFallbackPDProbe")
-			pdLoc, pdErr := c.RegionCache.LocateRegionByIDFromPD(bo.TiKVBackoffer(), cachedLoc.Region.GetID())
+			pdLoc, pdErr := func() (*tikv.KeyLocation, error) {
+				defer func() {
+					c.finishBucketFallbackProbe(cachedLoc.Region, time.Now())
+				}()
+				failpoint.InjectCall("beforeBucketFallbackPDProbe")
+				return c.RegionCache.LocateRegionByIDFromPD(bo.TiKVBackoffer(), cachedLoc.Region.GetID())
+			}()
 			if pdErr != nil {
 				fields = append(fields, zap.Error(pdErr))
 			} else {
